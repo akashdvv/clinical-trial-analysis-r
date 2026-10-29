@@ -1,0 +1,172 @@
+---
+title: "Adjuvant Chemotherapy for Stage C Colon Cancer: Reanalysis of a Randomized Trial"
+output:
+  github_document:
+    toc: true
+    fig_width: 8
+    fig_height: 4.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.path = "figures/", dpi = 150)
+library(survival)
+library(dplyr)
+library(ggplot2)
+library(broom)
+source("R/helpers.R")
+data(cancer, package = "survival")
+```
+
+**Run it:** `Rscript -e 'rmarkdown::render("analysis.Rmd", output_file = "README.md")'` (needs R ≥ 4.1 with
+survival, dplyr, ggplot2, broom, rmarkdown; see `install.R`). This README is the rendered report. Every number
+in the text is computed in the code, not typed in.
+
+## Study
+
+The North Central Cancer Treatment Group / Mayo Clinic trial (Moertel et al., *NEJM* 1990) randomized patients with
+resected **stage C (node-positive) colon cancer** to:
+
+- **Obs**: observation only
+- **Lev**: levamisole
+- **Lev+5FU**: levamisole plus fluorouracil
+
+Each patient has two records in `survival::colon`, one for recurrence (`etype = 1`) and one for death
+(`etype = 2`). This report checks that randomization balanced the arms, estimates the treatment effect on
+**overall survival** (primary) and **recurrence-free survival** (secondary), adjusts for prognostic factors
+with Cox regression, checks the model's assumptions, and tests whether the effect differs by nodal burden.
+
+```{r data}
+death <- prepare(colon, endpoint = 2)   # overall survival
+recur <- prepare(colon, endpoint = 1)   # recurrence-free survival
+c(patients = nrow(death), deaths = sum(death$status), recurrences = sum(recur$status),
+  median_followup_years = round(median(death$years[death$status == 0]), 1))
+```
+
+## 1. Did randomization balance the arms?
+
+```{r table1}
+table1 <- baseline_table(death)
+knitr::kable(table1, align = "lrrrr")
+pvals <- suppressWarnings(as.numeric(sub("<", "", table1$p_value)))
+n_tests <- sum(!is.na(pvals)); sig <- table1$characteristic[!is.na(pvals) & pvals < 0.05]
+```
+
+`r length(sig)` of `r n_tests` baseline characteristics differ at p < 0.05 (`r paste(sig, collapse = ", ")`).
+With `r n_tests` tests, about `r round(0.05 * n_tests, 1)` "significant" result is expected by chance alone, and none
+survives a Bonferroni correction (p < `r round(0.05 / n_tests, 4)`). The arms are balanced on every strong prognostic
+factor (nodes, obstruction, extent, differentiation). Sex is included in the adjusted models below as a safeguard.
+
+## 2. Overall survival (primary endpoint)
+
+```{r km_os, fig.height=5}
+fit_os <- survfit(Surv(years, status) ~ rx, data = death)
+km_plot(fit_os, "Overall survival by treatment arm", "Proportion alive")
+```
+
+```{r os_numbers}
+km_summary(fit_os, times = c(3, 5))
+lr_os   <- survdiff(Surv(years, status) ~ rx, data = death)
+lr_os_p <- survdiff(Surv(years, status) ~ rx, data = droplevels(subset(death, rx != "Lev")))
+s5 <- summary(fit_os, times = 5)$surv
+```
+
+- 5-year survival: **`r pct(s5[3])` with Lev+5FU vs `r pct(s5[1])` with observation** (levamisole alone `r pct(s5[2])`)
+- Log-rank, all three arms: χ² = `r round(lr_os$chisq, 1)`, p = `r pfmt(lr_os$chisq, 2)`
+- Log-rank, Lev+5FU vs observation: χ² = `r round(lr_os_p$chisq, 1)`, p = `r pfmt(lr_os_p$chisq, 1)`
+
+## 3. Recurrence-free survival (secondary endpoint)
+
+```{r km_rfs, fig.height=5}
+fit_rfs <- survfit(Surv(years, status) ~ rx, data = recur)
+km_plot(fit_rfs, "Recurrence-free survival by treatment arm", "Proportion recurrence-free")
+km_summary(fit_rfs, times = c(3, 5))
+lr_rfs <- survdiff(Surv(years, status) ~ rx, data = recur)
+r5 <- summary(fit_rfs, times = 5)$surv
+```
+
+5-year recurrence-free survival: **`r pct(r5[3])` with Lev+5FU vs `r pct(r5[1])` with observation**
+(log-rank p = `r pfmt(lr_rfs$chisq, 2)`).
+
+## 4. Cox proportional-hazards models
+
+The first adjusted model (all covariates as terms) failed the proportional-hazards check for several
+**prognostic** covariates (Section 4.1). The primary adjusted model therefore **stratifies** on those covariates. Each
+stratum gets its own baseline hazard, and the treatment hazard ratio is estimated within strata.
+
+```{r cox}
+f_adj   <- Surv(years, status) ~ rx + node4 + extent_grp + obstruct + differ_grp + sex + age10
+f_strat <- Surv(years, status) ~ rx + extent_grp + sex + age10 + strata(node4, differ_grp, obstruct)
+models <- list(
+  "Death, unadjusted"             = coxph(Surv(years, status) ~ rx, data = death),
+  "Death, adjusted (stratified)"  = coxph(f_strat, data = death),
+  "Recurrence, unadjusted"        = coxph(Surv(years, status) ~ rx, data = recur),
+  "Recurrence, adjusted (stratified)" = coxph(f_strat, data = recur)
+)
+hr <- bind_rows(lapply(names(models), function(m) hr_table(models[[m]]) |> mutate(model = m)))
+knitr::kable(filter(hr, grepl("^rx", term)) |> select(model, term, HR, CI_95, p_value))
+hr_d <- filter(hr, model == "Death, adjusted (stratified)", term == "rxLev+5FU")
+hr_r <- filter(hr, model == "Recurrence, adjusted (stratified)", term == "rxLev+5FU")
+```
+
+- **Levamisole + 5-FU reduced the hazard of death by `r pct(1 - hr_d$estimate, 0)`** (HR `r hr_d$HR`, 95% CI `r hr_d$CI_95`)
+  and the **hazard of recurrence by `r pct(1 - hr_r$estimate, 0)`** (HR `r hr_r$HR`, 95% CI `r hr_r$CI_95`).
+- Levamisole alone had no detectable effect on either endpoint.
+- Adjustment barely moves the estimates, as expected when randomization worked.
+
+### Prognostic factors
+
+```{r forest, fig.height=4.5}
+cox_terms <- coxph(f_adj, data = death)
+forest_plot(hr_table(cox_terms), "Hazard ratios for death (all covariates as terms)")
+```
+
+```{r prognostic}
+prog <- hr_table(cox_terms) |> filter(term == "node4>4 nodes")
+```
+
+More than 4 positive lymph nodes is the strongest prognostic factor (HR `r prog$HR`, 95% CI `r prog$CI_95`). Hazard
+ratios for covariates that violate proportional hazards are **averages over follow-up** and should be read as such.
+
+### 4.1 Checking the proportional-hazards assumption
+
+```{r zph}
+zph_terms <- cox.zph(cox_terms)
+zph_strat <- cox.zph(models[["Death, adjusted (stratified)"]])
+knitr::kable(zph_df(zph_terms), caption = "All covariates as terms")
+knitr::kable(zph_df(zph_strat), caption = "Primary model: stratified on nodes, differentiation, obstruction")
+viol <- rownames(zph_terms$table)[zph_terms$table[, "p"] < 0.05 & rownames(zph_terms$table) != "GLOBAL"]
+```
+
+Covariates whose effect changes over time in the all-terms model: **`r paste(viol, collapse = ", ")`**. The **treatment
+term satisfies the assumption** in both models (p = `r round(zph_terms$table["rx", "p"], 2)` and
+`r round(zph_strat$table["rx", "p"], 2)`), so the treatment hazard ratio is a valid summary of the effect over follow-up.
+
+## 5. Does the benefit depend on nodal burden? (subgroup analysis)
+
+```{r subgroup}
+cox_main <- coxph(Surv(years, status) ~ rx + node4, data = death)
+cox_int  <- coxph(Surv(years, status) ~ rx * node4, data = death)
+p_int <- anova(cox_main, cox_int)[["Pr(>|Chi|)"]][2]
+sub <- bind_rows(lapply(split(death, death$node4), function(d) {
+  hr_table(coxph(Surv(years, status) ~ rx, data = d)) |> filter(grepl("^rx", term)) |> mutate(subgroup = as.character(d$node4[1]))
+}))
+knitr::kable(sub |> select(subgroup, term, HR, CI_95, p_value))
+```
+
+Treatment × nodes interaction: p = `r round(p_int, 3)`. The point estimates differ between subgroups, but the
+interaction test gives no evidence that the benefit really differs. The subgroup with >4 nodes is smaller, so its
+confidence interval is wider. The overall hazard ratio remains the best estimate for both groups.
+
+## 6. Conclusions
+
+1. Randomization produced well-balanced arms. The one nominal imbalance (sex) is consistent with chance and was adjusted for.
+2. **Levamisole + 5-FU improved survival.** At 5 years, `r pct(s5[3])` of patients were alive versus `r pct(s5[1])`
+   with observation, and the adjusted hazard of death was `r pct(1 - hr_d$estimate, 0)` lower. This is consistent with
+   the original publication, which made the regimen standard adjuvant therapy in 1990.
+3. **Levamisole alone was ineffective.** The benefit comes from adding fluorouracil.
+4. Several prognostic factors violate proportional hazards. Stratifying on them leaves the treatment effect unchanged,
+   and the treatment term itself satisfies the assumption.
+5. There is no reliable evidence that the benefit differs by nodal burden.
+
+*Data: `survival::colon`, R package survival. Moertel CG et al. Levamisole and fluorouracil for adjuvant therapy of
+resected colon carcinoma. N Engl J Med 1990;322:352-8. Educational reanalysis. Treatment standards have since changed.*
